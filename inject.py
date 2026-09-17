@@ -1,191 +1,146 @@
+import ctypes
 import os
 import sys
-import shutil
-import struct
+import time
+import subprocess
+from ctypes import wintypes
 
-def find_server_exe():
+PROCESS_ALL_ACCESS = 0x1F0FFF
+MEM_COMMIT = 0x00001000
+MEM_RESERVE = 0x00002000
+PAGE_READWRITE = 0x04
+
+kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+OpenProcess = kernel32.OpenProcess
+OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+OpenProcess.restype = wintypes.HANDLE
+
+VirtualAllocEx = kernel32.VirtualAllocEx
+VirtualAllocEx.argtypes = [wintypes.HANDLE, wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
+VirtualAllocEx.restype = wintypes.LPVOID
+
+WriteProcessMemory = kernel32.WriteProcessMemory
+WriteProcessMemory.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.LPCVOID, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+WriteProcessMemory.restype = wintypes.BOOL
+
+GetProcAddress = kernel32.GetProcAddress
+GetProcAddress.argtypes = [wintypes.HMODULE, wintypes.LPCSTR]
+GetProcAddress.restype = wintypes.LPVOID
+
+GetModuleHandleW = kernel32.GetModuleHandleW
+GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+GetModuleHandleW.restype = wintypes.HMODULE
+
+CreateRemoteThread = kernel32.CreateRemoteThread
+CreateRemoteThread.argtypes = [wintypes.HANDLE, wintypes.LPVOID, ctypes.c_size_t, wintypes.LPVOID, wintypes.LPVOID, wintypes.DWORD, wintypes.LPDWORD]
+CreateRemoteThread.restype = wintypes.HANDLE
+
+WaitForSingleObject = kernel32.WaitForSingleObject
+WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+WaitForSingleObject.restype = wintypes.DWORD
+
+CloseHandle = kernel32.CloseHandle
+CloseHandle.argtypes = [wintypes.HANDLE]
+CloseHandle.restype = wintypes.BOOL
+
+def find_server_paths():
     current = os.path.abspath(os.getcwd())
     candidates = [
+        os.path.join(current, "TrenchblocksServer-Win64-Shipping.exe"),
         os.path.join(current, "Trenchblocks", "Binaries", "Win64", "TrenchblocksServer-Win64-Shipping.exe"),
         os.path.join(current, "Binaries", "Win64", "TrenchblocksServer-Win64-Shipping.exe"),
-        os.path.join(current, "TrenchblocksServer-Win64-Shipping.exe")
     ]
     
-    for path in candidates:
-        if os.path.exists(path):
-            return path
+    for exe in candidates:
+        if os.path.exists(exe):
+            bin_dir = os.path.dirname(exe)
+            dll = os.path.join(bin_dir, "ue4ss", "UE4SS.dll")
+            if not os.path.exists(dll):
+                dll = os.path.join(bin_dir, "UE4SS.dll")
+            return exe, bin_dir, dll
             
     for root, dirs, files in os.walk(current):
         if "TrenchblocksServer-Win64-Shipping.exe" in files:
-            return os.path.join(root, "TrenchblocksServer-Win64-Shipping.exe")
+            exe = os.path.join(root, "TrenchblocksServer-Win64-Shipping.exe")
+            bin_dir = root
+            dll = os.path.join(bin_dir, "ue4ss", "UE4SS.dll")
+            if not os.path.exists(dll):
+                dll = os.path.join(bin_dir, "UE4SS.dll")
+            return exe, bin_dir, dll
             
-    return None
+    return None, None, None
 
-def align(val, alignment):
-    return (val + alignment - 1) & ~(alignment - 1)
-
-def inject_dll_to_pe(exe_path, dll_name="UE4SS.dll"):
-    print(f"[*] Reading binary: {exe_path}")
-    with open(exe_path, "rb") as f:
-        data = bytearray(f.read())
-        
-    if data[:2] != b"MZ":
-        raise ValueError("Invalid PE: Missing MZ header")
-        
-    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
-    if data[pe_offset:pe_offset+4] != b"PE\x00\x00":
-        raise ValueError("Invalid PE: Missing PE signature")
-        
-    num_sections = struct.unpack_from("<H", data, pe_offset + 6)[0]
-    opt_header_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
-    opt_header_offset = pe_offset + 24
+def inject_dll(pid, dll_path):
+    print(f"[*] Injecting '{dll_path}' into PID {pid}...")
     
-    magic = struct.unpack_from("<H", data, opt_header_offset)[0]
-    if magic != 0x20B:
-        raise ValueError("Only 64-bit PE binaries are supported")
-        
-    image_base = struct.unpack_from("<Q", data, opt_header_offset + 24)[0]
-    section_alignment = struct.unpack_from("<I", data, opt_header_offset + 32)[0]
-    file_alignment = struct.unpack_from("<I", data, opt_header_offset + 36)[0]
-    size_of_image = struct.unpack_from("<I", data, opt_header_offset + 56)[0]
-    size_of_headers = struct.unpack_from("<I", data, opt_header_offset + 60)[0]
-    
-    data_dir_offset = opt_header_offset + 112
-    import_rva, import_size = struct.unpack_from("<II", data, data_dir_offset + 8)
-    
-    section_headers_offset = opt_header_offset + opt_header_size
-    last_section_offset = section_headers_offset + (num_sections - 1) * 40
-    
-    last_sec_name, last_sec_vsize, last_sec_va, last_sec_raw_size, last_sec_raw_ptr = struct.unpack_from("<8sIIII", data, last_section_offset)
-    
-    # Check if already injected
-    if b".ue4ss\x00\x00\x00" in data[section_headers_offset:section_headers_offset + num_sections * 40]:
-        print("[!] Target binary already has .ue4ss section injected.")
+    if not os.path.exists(dll_path):
+        print(f"[-] Error: DLL not found at {dll_path}")
         return False
         
-    new_sec_offset = section_headers_offset + num_sections * 40
-    if new_sec_offset + 40 > size_of_headers:
-        raise ValueError("Not enough space in header for a new section")
+    dll_path_encoded = os.path.abspath(dll_path).encode('utf-16le') + b'\x00\x00'
+    path_len = len(dll_path_encoded)
+    
+    h_process = OpenProcess(PROCESS_ALL_ACCESS, False, pid)
+    if not h_process:
+        print(f"[-] OpenProcess failed: {ctypes.get_last_error()}")
+        return False
         
-    new_sec_va = align(last_sec_va + max(last_sec_vsize, last_sec_raw_size), section_alignment)
-    new_sec_raw_ptr = align(len(data), file_alignment)
-    
-    existing_import_data = bytearray()
-    if import_rva != 0 and import_size != 0:
-        for i in range(num_sections):
-            sec_offset = section_headers_offset + i * 40
-            s_name, s_vsize, s_va, s_raw_size, s_raw_ptr = struct.unpack_from("<8sIIII", data, sec_offset)
-            if s_va <= import_rva < s_va + s_raw_size:
-                offset_in_file = s_raw_ptr + (import_rva - s_va)
-                existing_import_data = bytearray(data[offset_in_file:offset_in_file + import_size])
-                break
-                
-    if len(existing_import_data) >= 20 and existing_import_data[-20:] == b"\x00" * 20:
-        existing_descriptor_count = len(existing_import_data) // 20 - 1
-    else:
-        existing_descriptor_count = 0
-        
-    payload = bytearray()
-    
-    num_descriptors = existing_descriptor_count + 1 + 1
-    descriptor_table_size = num_descriptors * 20
-    
-    dll_name_bytes = dll_name.encode('ascii') + b"\x00"
-    func_name_bytes = b"\x00\x00DummyExport\x00"
-    
-    dll_name_rel_offset = descriptor_table_size
-    func_name_rel_offset = dll_name_rel_offset + len(dll_name_bytes)
-    if func_name_rel_offset % 2 != 0:
-        func_name_bytes = b"\x00" + func_name_bytes
-        func_name_rel_offset += 1
-        
-    ilt_rel_offset = align(func_name_rel_offset + len(func_name_bytes), 8)
-    iat_rel_offset = ilt_rel_offset + 16
-    
-    new_sec_payload_size = iat_rel_offset + 16
-    
-    if existing_descriptor_count > 0:
-        payload.extend(existing_import_data[:existing_descriptor_count * 20])
-        
-    new_ilt_rva = new_sec_va + ilt_rel_offset
-    new_name_rva = new_sec_va + dll_name_rel_offset
-    new_iat_rva = new_sec_va + iat_rel_offset
-    
-    new_descriptor = struct.pack("<IIIII", new_ilt_rva, 0, 0, new_name_rva, new_iat_rva)
-    payload.extend(new_descriptor)
-    payload.extend(b"\x00" * 20)
-    payload.extend(dll_name_bytes)
-    
-    if len(payload) < func_name_rel_offset:
-        payload.extend(b"\x00" * (func_name_rel_offset - len(payload)))
-    payload.extend(func_name_bytes)
-    
-    func_rva = new_sec_va + func_name_rel_offset
-    if len(payload) < ilt_rel_offset:
-        payload.extend(b"\x00" * (ilt_rel_offset - len(payload)))
-        
-    payload.extend(struct.pack("<Q", func_rva))
-    payload.extend(struct.pack("<Q", 0))
-    payload.extend(struct.pack("<Q", func_rva))
-    payload.extend(struct.pack("<Q", 0))
-    
-    new_sec_raw_size = align(len(payload), file_alignment)
-    new_sec_vsize = len(payload)
-    
-    payload.extend(b"\x00" * (new_sec_raw_size - len(payload)))
-    
-    sec_name = b".ue4ss\x00\x00"
-    sec_characteristics = 0xC0000040
-    
-    struct.pack_into("<8sIIIIIIHHI", data, new_sec_offset,
-                     sec_name,
-                     new_sec_vsize,
-                     new_sec_va,
-                     new_sec_raw_size,
-                     new_sec_raw_ptr,
-                     0, 0, 0, 0,
-                     sec_characteristics)
-                     
-    struct.pack_into("<H", data, pe_offset + 6, num_sections + 1)
-    struct.pack_into("<I", data, opt_header_offset + 56, align(new_sec_va + new_sec_vsize, section_alignment))
-    struct.pack_into("<II", data, data_dir_offset + 8, new_sec_va, descriptor_table_size)
-    
-    if len(data) < new_sec_raw_ptr:
-        data.extend(b"\x00" * (new_sec_raw_ptr - len(data)))
-        
-    data.extend(payload)
-    
-    bak_path = exe_path + ".bak"
-    if not os.path.exists(bak_path):
-        print(f"[*] Creating backup: {bak_path}")
-        shutil.copy2(exe_path, bak_path)
-        
-    print(f"[*] Writing patched PE to: {exe_path}")
-    with open(exe_path, "wb") as f:
-        f.write(data)
-        
-    print(f"[+] Successfully injected '{dll_name}' into {os.path.basename(exe_path)}!")
-    return True
+    try:
+        remote_mem = VirtualAllocEx(h_process, None, path_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        if not remote_mem:
+            return False
+            
+        bytes_written = ctypes.c_size_t(0)
+        if not WriteProcessMemory(h_process, remote_mem, dll_path_encoded, path_len, ctypes.byref(bytes_written)):
+            return False
+            
+        h_k32 = GetModuleHandleW("kernel32.dll")
+        load_library_w = GetProcAddress(h_k32, b"LoadLibraryW")
+        if not load_library_w:
+            return False
+            
+        h_thread = CreateRemoteThread(h_process, None, 0, load_library_w, remote_mem, 0, None)
+        if not h_thread:
+            return False
+            
+        WaitForSingleObject(h_thread, 5000)
+        CloseHandle(h_thread)
+        print("[+] UE4SS.dll successfully injected into Dedicated Server!")
+        return True
+    finally:
+        CloseHandle(h_process)
 
 def main():
     print("==================================================")
-    print("  Trenchblocks Dedicated Server - UE4SS Injector  ")
+    print("  Trenchblocks Dedicated Server Launcher & UE4SS  ")
     print("==================================================")
     
-    exe_path = find_server_exe()
-    if not exe_path:
-        print("[!] Error: Could not locate 'TrenchblocksServer-Win64-Shipping.exe'.")
-        print("    Please run this script from the game root or Trenchblocks/Binaries/Win64/.")
+    server_exe, bin_dir, ue4ss_dll = find_server_paths()
+    if not server_exe or not os.path.exists(server_exe):
+        print("[-] Error: Could not locate 'TrenchblocksServer-Win64-Shipping.exe'.")
+        print("    Please run this script from the server root or Trenchblocks/Binaries/Win64/.")
         sys.exit(1)
         
-    print(f"[*] Server Binary Found: {exe_path}")
-    
-    try:
-        inject_dll_to_pe(exe_path, "UE4SS.dll")
-        print("\n[+] Injection finished! You can now launch Trenchblocks Dedicated Server.")
-    except Exception as e:
-        print(f"\n[!] Injection failed: {e}")
+    if not ue4ss_dll or not os.path.exists(ue4ss_dll):
+        print(f"[-] Error: Could not locate UE4SS.dll in '{bin_dir}' or '{bin_dir}\\ue4ss'.")
         sys.exit(1)
+        
+    cmd = [server_exe] + sys.argv[1:]
+    print(f"[*] Found Server Exe: {server_exe}")
+    print(f"[*] Found UE4SS DLL:  {ue4ss_dll}")
+    print(f"[*] Launching: {' '.join(cmd)}")
+    
+    proc = subprocess.Popen(cmd, cwd=bin_dir)
+    print(f"[*] Server process started (PID: {proc.pid})")
+    
+    # 1.0s golden time for server initialization
+    time.sleep(1.0)
+    
+    if inject_dll(proc.pid, ue4ss_dll):
+        print("[+] Dedicated Server and UE4SS are running perfectly!")
+    else:
+        print("[-] Injection failed.")
 
 if __name__ == "__main__":
     main()
