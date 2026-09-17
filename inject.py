@@ -111,6 +111,33 @@ def inject_dll(pid, dll_path):
     finally:
         CloseHandle(h_process)
 
+def parse_server_args(args):
+    parsed = []
+    has_log = False
+    
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        
+        if arg.lower() in ("-p", "--port", "-port"):
+            if i + 1 < len(args):
+                parsed.append(f"-Port={args[i+1]}")
+                i += 2
+                continue
+        elif arg.lower().startswith("-port="):
+            parsed.append(arg)
+        elif arg.lower() in ("-log", "--log"):
+            has_log = True
+            parsed.append("-log")
+        else:
+            parsed.append(arg)
+        i += 1
+        
+    if not has_log and "-log" not in parsed:
+        parsed.append("-log")
+        
+    return parsed
+
 def main():
     print("==================================================")
     print("  Trenchblocks Dedicated Server Launcher & UE4SS  ")
@@ -126,10 +153,12 @@ def main():
         print(f"[-] Error: Could not locate UE4SS.dll in '{bin_dir}' or '{bin_dir}\\ue4ss'.")
         sys.exit(1)
         
-    cmd = [server_exe] + sys.argv[1:]
+    forwarded_args = parse_server_args(sys.argv[1:])
+    cmd = [server_exe] + forwarded_args
+    
     print(f"[*] Found Server Exe: {server_exe}")
     print(f"[*] Found UE4SS DLL:  {ue4ss_dll}")
-    print(f"[*] Launching: {' '.join(cmd)}")
+    print(f"[*] Launching Command: {' '.join(cmd)}")
     
     proc = subprocess.Popen(cmd, cwd=bin_dir)
     print(f"[*] Server process started (PID: {proc.pid})")
